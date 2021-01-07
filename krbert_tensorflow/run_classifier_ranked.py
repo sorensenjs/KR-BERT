@@ -683,7 +683,7 @@ def main(_):
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
   tpu_strategy = tf.distribute.experimental.TPUStrategy(tpu_cluster_resolver)
-  with wpu_strategy.scope()
+  with wpu_strategy.scope():
     model_fn = model_fn_builder(
         bert_config=bert_config,
         num_labels=len(label_list),
