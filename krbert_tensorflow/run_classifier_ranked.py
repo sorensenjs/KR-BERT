@@ -83,20 +83,6 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
-
-flags.DEFINE_string(
-    "tpu_name", None,
-    "The Cloud TPU to use for training. This should be either the name "
-    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
-    "url.")
-
-flags.DEFINE_string(
-    "tpu_zone", None,
-    "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
 flags.DEFINE_string(
     "gcp_project", None,
     "[Optional] Project name for the Cloud TPU-enabled project. If not "
@@ -467,7 +453,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
+                     num_train_steps, num_warmup_steps,
                      use_one_hot_embeddings):
   """Returns `model_fn` closure for TPUEstimator."""
 
@@ -500,15 +486,11 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     if init_checkpoint:
       (assignment_map, initialized_variable_names
       ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.compat.v1.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
+      def tpu_scaffold():
         tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
+        return tf.compat.v1.train.Scaffold()
+
+      scaffold_fn = tpu_scaffold
 
     tf.compat.v1.logging.info("**** Trainable Variables ****")
     for var in tvars:
@@ -522,7 +504,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     if mode == tf.estimator.ModeKeys.TRAIN:
 
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps)
 
       output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
           mode=mode,
@@ -678,10 +660,9 @@ def main(_):
   tokenizer = tokenization.FullTokenizer(
       vocab_file=real_vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+  tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+  tf.config.experimental_connect_to_cluster(tpu_cluster_resolver)
+  tf.config.experimental.initialize_tpu_system(tpu_cluster_resolver)
 
   run_config = tf.compat.v1.estimator.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
@@ -701,46 +682,43 @@ def main(_):
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
 
+  tpu_strategy = tf.distribute.experimental.TPUStrategy(tpu_cluster_resolver)
+    model_fn = model_fn_builder(
+        bert_config=bert_config,
+        num_labels=len(label_list),
+        init_checkpoint=real_init_checkpoint,
+        learning_rate=FLAGS.learning_rate,
+        num_train_steps=num_train_steps,
+        num_warmup_steps=num_warmup_steps,
+        use_one_hot_embeddings=True)
 
-  model_fn = model_fn_builder(
-      bert_config=bert_config,
-      num_labels=len(label_list),
-      init_checkpoint=real_init_checkpoint,
-      learning_rate=FLAGS.learning_rate,
-      num_train_steps=num_train_steps,
-      num_warmup_steps=num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+    # If TPU is not available, this will fall back to normal Estimator on CPU
+    # or GPU.
+    estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
+        model_fn=model_fn,
+        config=run_config,
+        train_batch_size=FLAGS.train_batch_size,
+        eval_batch_size=FLAGS.eval_batch_size,
+        predict_batch_size=FLAGS.predict_batch_size)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size,
-      predict_batch_size=FLAGS.predict_batch_size)
+    if FLAGS.do_train:
+      train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
+      file_based_convert_examples_to_features(
+          train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+      tf.compat.v1.logging.info("***** Running training *****")
+      tf.compat.v1.logging.info("  Num examples = %d", len(train_examples))
+      tf.compat.v1.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+      tf.compat.v1.logging.info("  Num steps = %d", num_train_steps)
+      train_input_fn = file_based_input_fn_builder(
+          input_file=train_file,
+          seq_length=FLAGS.max_seq_length,
+          is_training=True,
+          drop_remainder=True)
+      estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
-  if FLAGS.do_train:
-    train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-    file_based_convert_examples_to_features(
-        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
-    tf.compat.v1.logging.info("***** Running training *****")
-    tf.compat.v1.logging.info("  Num examples = %d", len(train_examples))
-    tf.compat.v1.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-    tf.compat.v1.logging.info("  Num steps = %d", num_train_steps)
-    train_input_fn = file_based_input_fn_builder(
-        input_file=train_file,
-        seq_length=FLAGS.max_seq_length,
-        is_training=True,
-        drop_remainder=True)
-    estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-
-  if FLAGS.do_eval:
-    eval_examples = processor.get_dev_examples(real_data_dir)
-    num_actual_eval_examples = len(eval_examples)
-    if FLAGS.use_tpu:
+    if FLAGS.do_eval:
+      eval_examples = processor.get_dev_examples(real_data_dir)
+      num_actual_eval_examples = len(eval_examples)
       # TPU requires a fixed batch size for all batches, therefore the number
       # of examples must be a multiple of the batch size, or else examples
       # will get dropped. So we pad with fake examples which are ignored
@@ -749,85 +727,79 @@ def main(_):
       while len(eval_examples) % FLAGS.eval_batch_size != 0:
         eval_examples.append(PaddingInputExample())
 
-    eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-    file_based_convert_examples_to_features(
-        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+      eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
+      file_based_convert_examples_to_features(
+          eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
 
-    tf.compat.v1.logging.info("***** Running evaluation *****")
-    tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
-                    len(eval_examples), num_actual_eval_examples,
-                    len(eval_examples) - num_actual_eval_examples)
-    tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+      tf.compat.v1.logging.info("***** Running evaluation *****")
+      tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                      len(eval_examples), num_actual_eval_examples,
+                      len(eval_examples) - num_actual_eval_examples)
+      tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
-    # This tells the estimator to run through the entire set.
-    eval_steps = None
-    # However, if running eval on the TPU, you will need to specify the
-    # number of steps.
-    if FLAGS.use_tpu:
+      # This tells the estimator to run through the entire set.
+      eval_steps = None
+      # However, if running eval on the TPU, you will need to specify the
+      # number of steps.
       assert len(eval_examples) % FLAGS.eval_batch_size == 0
       eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
 
-    eval_drop_remainder = True if FLAGS.use_tpu else False
-    eval_input_fn = file_based_input_fn_builder(
-        input_file=eval_file,
-        seq_length=FLAGS.max_seq_length,
-        is_training=False,
-        drop_remainder=eval_drop_remainder)
+      eval_drop_remainder = True
+      eval_input_fn = file_based_input_fn_builder(
+          input_file=eval_file,
+          seq_length=FLAGS.max_seq_length,
+          is_training=False,
+          drop_remainder=eval_drop_remainder)
 
-    result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
+      result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
 
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.io.gfile.GFile(output_eval_file, "w") as writer:
-      tf.compat.v1.logging.info("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.compat.v1.logging.info("  %s = %s", key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
+      output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
+      with tf.io.gfile.GFile(output_eval_file, "w") as writer:
+        tf.compat.v1.logging.info("***** Eval results *****")
+        for key in sorted(result.keys()):
+          tf.compat.v1.logging.info("  %s = %s", key, str(result[key]))
+          writer.write("%s = %s\n" % (key, str(result[key])))
 
-  if FLAGS.do_predict:
-    predict_examples = processor.get_test_examples(real_data_dir)
-    num_actual_predict_examples = len(predict_examples)
-    if FLAGS.use_tpu:
-      # TPU requires a fixed batch size for all batches, therefore the number
-      # of examples must be a multiple of the batch size, or else examples
-      # will get dropped. So we pad with fake examples which are ignored
-      # later on.
+    if FLAGS.do_predict:
+      predict_examples = processor.get_test_examples(real_data_dir)
+      num_actual_predict_examples = len(predict_examples)
       while len(predict_examples) % FLAGS.predict_batch_size != 0:
         predict_examples.append(PaddingInputExample())
 
-    predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-    file_based_convert_examples_to_features(predict_examples, label_list,
-                                            FLAGS.max_seq_length, tokenizer,
-                                            predict_file)
+      predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
+      file_based_convert_examples_to_features(predict_examples, label_list,
+                                              FLAGS.max_seq_length, tokenizer,
+                                              predict_file)
 
-    tf.compat.v1.logging.info("***** Running prediction*****")
-    tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
-                    len(predict_examples), num_actual_predict_examples,
-                    len(predict_examples) - num_actual_predict_examples)
-    tf.compat.v1.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+      tf.compat.v1.logging.info("***** Running prediction*****")
+      tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                      len(predict_examples), num_actual_predict_examples,
+                      len(predict_examples) - num_actual_predict_examples)
+      tf.compat.v1.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
 
-    predict_drop_remainder = True if FLAGS.use_tpu else False
-    predict_input_fn = file_based_input_fn_builder(
-        input_file=predict_file,
-        seq_length=FLAGS.max_seq_length,
-        is_training=False,
-        drop_remainder=predict_drop_remainder)
+      predict_drop_remainder = True
+      predict_input_fn = file_based_input_fn_builder(
+          input_file=predict_file,
+          seq_length=FLAGS.max_seq_length,
+          is_training=False,
+          drop_remainder=predict_drop_remainder)
 
-    result = estimator.predict(input_fn=predict_input_fn)
+      result = estimator.predict(input_fn=predict_input_fn)
 
-    output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
-    with tf.io.gfile.GFile(output_predict_file, "w") as writer:
-      num_written_lines = 0
-      tf.compat.v1.logging.info("***** Predict results *****")
-      for (i, prediction) in enumerate(result):
-        probabilities = prediction["probabilities"]
-        if i >= num_actual_predict_examples:
-          break
-        output_line = "\t".join(
-            str(class_probability)
-            for class_probability in probabilities) + "\n"
-        writer.write(output_line)
-        num_written_lines += 1
-    assert num_written_lines == num_actual_predict_examples
+      output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
+      with tf.io.gfile.GFile(output_predict_file, "w") as writer:
+        num_written_lines = 0
+        tf.compat.v1.logging.info("***** Predict results *****")
+        for (i, prediction) in enumerate(result):
+          probabilities = prediction["probabilities"]
+          if i >= num_actual_predict_examples:
+            break
+          output_line = "\t".join(
+              str(class_probability)
+              for class_probability in probabilities) + "\n"
+          writer.write(output_line)
+          num_written_lines += 1
+      assert num_written_lines == num_actual_predict_examples
 
 
 if __name__ == "__main__":

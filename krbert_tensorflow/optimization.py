@@ -23,7 +23,7 @@ import tensorflow as tf
 # from tensorflow.train import GradientDescentOptimizer, MomentumOptimizer, AdadeltaOptimizer, AdagradOptimizer, RMSPropOptimizer
 
 
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
+def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps):
   """Creates an optimizer training op."""
   global_step = tf.compat.v1.train.get_or_create_global_step()
 
@@ -105,8 +105,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
   #   )
 
 
-  if use_tpu:
-    optimizer = tf.compat.v1.tpu.CrossShardOptimizer(optimizer)
+  optimizer = tf.compat.v1.tpu.CrossShardOptimizer(optimizer)
 
   tvars = tf.compat.v1.trainable_variables()
   grads = tf.gradients(ys=loss, xs=tvars)
